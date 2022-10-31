@@ -112,7 +112,7 @@ class Block(nn.Module):
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
 
 
-    def forward(self, x, B, T, W):
+    def forward(self, x, B, T, W):  # b (h/patch w/patch t) + 1, embed_dim
         num_spatial_tokens = (x.size(1) - 1) // T
         H = num_spatial_tokens // W
 
@@ -122,20 +122,20 @@ class Block(nn.Module):
             return x
         elif self.attention_type == 'divided_space_time':
             ## Temporal
-            xt = x[:,1:,:]
-            xt = rearrange(xt, 'b (h w t) m -> (b h w) t m',b=B,h=H,w=W,t=T)
+            xt = x[:,1:,:]  # b (h/patch w/patch t), embed_dim
+            xt = rearrange(xt, 'b (h w t) m -> (b h w) t m',b=B,h=H,w=W,t=T)  # (b h/patch w/patch), t, embed_dim
             res_temporal = self.drop_path(self.temporal_attn(self.temporal_norm1(xt)))
-            res_temporal = rearrange(res_temporal, '(b h w) t m -> b (h w t) m',b=B,h=H,w=W,t=T)
-            res_temporal = self.temporal_fc(res_temporal)
-            xt = x[:,1:,:] + res_temporal
+            res_temporal = rearrange(res_temporal, '(b h w) t m -> b (h w t) m',b=B,h=H,w=W,t=T)  # b, (h/patch w/patch t), embed_dim
+            res_temporal = self.temporal_fc(res_temporal)  # b, (h/patch w/patch t), embed_dim
+            xt = x[:,1:,:] + res_temporal  # b, (h/patch w/patch t), embed_dim
 
             ## Spatial
             init_cls_token = x[:,0,:].unsqueeze(1)
             cls_token = init_cls_token.repeat(1, T, 1)
             cls_token = rearrange(cls_token, 'b t m -> (b t) m',b=B,t=T).unsqueeze(1)
-            xs = xt
-            xs = rearrange(xs, 'b (h w t) m -> (b t) (h w) m',b=B,h=H,w=W,t=T)
-            xs = torch.cat((cls_token, xs), 1)
+            xs = xt  # b, (h/patch w/patch t), embed_dim
+            xs = rearrange(xs, 'b (h w t) m -> (b t) (h w) m',b=B,h=H,w=W,t=T)  # (b t), (h/patch w/patch), embed_dim
+            xs = torch.cat((cls_token, xs), 1)  # b, (h/patch w/patch t) + 1, embed_dim
             res_spatial = self.drop_path(self.attn(self.norm1(xs)))
 
             ### Taking care of CLS token
@@ -144,13 +144,13 @@ class Block(nn.Module):
             cls_token = torch.mean(cls_token,1,True) ## averaging for every frame
             res_spatial = res_spatial[:,1:,:]
             res_spatial = rearrange(res_spatial, '(b t) (h w) m -> b (h w t) m',b=B,h=H,w=W,t=T)
-            res = res_spatial
-            x = xt
+            res = res_spatial  # b, (h/patch w/patch t), embed_dim
+            x = xt  # b, (h/patch w/patch t), embed_dim
 
             ## Mlp
-            x = torch.cat((init_cls_token, x), 1) + torch.cat((cls_token, res), 1)
-            x = x + self.drop_path(self.mlp(self.norm2(x)))
-            return x
+            x = torch.cat((init_cls_token, x), 1) + torch.cat((cls_token, res), 1)  # b, (h/patch w/patch t)+1, embed_dim
+            x = x + self.drop_path(self.mlp(self.norm2(x)))  # b, (h/patch w/patch t)+1, embed_dim
+            return x  # b, (h/patch w/patch t)+1, embed_dim
 
 class PatchEmbed(nn.Module):
     """ Image to Patch Embedding
@@ -169,10 +169,10 @@ class PatchEmbed(nn.Module):
     def forward(self, x):
         B, C, T, H, W = x.shape
         x = rearrange(x, 'b c t h w -> (b t) c h w')
-        x = self.proj(x)
-        W = x.size(-1)
-        x = x.flatten(2).transpose(1, 2)
-        return x, T, W
+        x = self.proj(x)  # (b t) embed_dim, h/patch, w/patch
+        W = x.size(-1)  # W = w/patch
+        x = x.flatten(2).transpose(1, 2)  # (b t), embed_dim, (h/patch, w/patch) -> (b t), (h/patch, w/patch), embed_dim
+        return x, T, W  # (b t), (h/patch, w/patch), embed_dim  |   t   |   w/patch
 
 
 class VisionTransformer(nn.Module):
@@ -182,6 +182,7 @@ class VisionTransformer(nn.Module):
                  num_heads=12, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop_rate=0., attn_drop_rate=0.,
                  drop_path_rate=0.1, hybrid_backbone=None, norm_layer=nn.LayerNorm, num_frames=8, attention_type='divided_space_time', dropout=0.):
         super().__init__()
+        self.patch_size = patch_size
         self.attention_type = attention_type
         self.depth = depth
         self.dropout = nn.Dropout(dropout)
@@ -208,8 +209,9 @@ class VisionTransformer(nn.Module):
             for i in range(self.depth)])
         self.norm = norm_layer(embed_dim)
 
-        # Classifier head
-        self.head = nn.Linear(embed_dim, num_classes) if num_classes > 0 else nn.Identity()
+        # head
+        # self.head = nn.Linear(embed_dim, num_classes) if num_classes > 0 else nn.Identity()
+        self.decoder = nn.Linear(embed_dim, patch_size ** 2 * in_chans, bias=True)  # decoder to patch
 
         trunc_normal_(self.pos_embed, std=.02)
         trunc_normal_(self.cls_token, std=.02)
@@ -246,11 +248,32 @@ class VisionTransformer(nn.Module):
         self.num_classes = num_classes
         self.head = nn.Linear(self.embed_dim, num_classes) if num_classes > 0 else nn.Identity()
 
-    def forward_features(self, x):
-        B = x.shape[0]
-        x, T, W = self.patch_embed(x)
-        cls_tokens = self.cls_token.expand(x.size(0), -1, -1)
-        x = torch.cat((cls_tokens, x), dim=1)
+    def random_masking(self, x, mask_ratio):
+        N, L, D = x.shape  # batch, length, dim
+        len_keep = int(L * (1 - mask_ratio))
+        noise = torch.rand(N, L)
+        ids_shuffle = torch.argsort(noise, dim=1)
+        mask = torch.ones([N, L], device=x.device)
+        mask[:, :len_keep] = 0
+        mask = torch.gather(mask, dim=1, index=ids_shuffle)
+        x = x.masked_fill(mask.unsqueeze(-1).repeat(1, 1, D) == 1, 0)
+        return x, mask
+
+    def patchify(self, x):
+        """
+        in: B, C, T, H, W
+        out: B, (h/patch w/patch t), (patch patch channel)
+        """
+        p = self.patch_size
+        x = rearrange(x, 'b c t (h p) (w q) -> b (h w t) (p q c)', p=p, q=p)
+
+        return x  # b, (h/patch w/patch t), (patch patch channel)
+
+    def forward_features(self, x, mask_ratio):  # B, C, T, H, W
+        B = x.shape[0]  # b
+        x, T, W = self.patch_embed(x)  # (b t), (h/patch, w/patch), embed_dim  |   t   |   w/patch
+        cls_tokens = self.cls_token.expand(x.size(0), -1, -1)  # (b t), 1, 1
+        x = torch.cat((cls_tokens, x), dim=1)  # (b t), (h/patch, w/patch) + 1, embed_dim
 
         ## resizing the positional embeddings in case they don't match the input at inference
         if x.size(1) != self.pos_embed.size(1):
@@ -272,9 +295,9 @@ class VisionTransformer(nn.Module):
 
         ## Time Embeddings
         if self.attention_type != 'space_only':
-            cls_tokens = x[:B, 0, :].unsqueeze(1)
-            x = x[:,1:]
-            x = rearrange(x, '(b t) n m -> (b n) t m',b=B,t=T)
+            cls_tokens = x[:B, 0, :].unsqueeze(1)  # b, 1, embed_dim
+            x = x[:,1:]  # (b t), (h/patch, w/patch), embed_dim
+            x = rearrange(x, '(b t) n m -> (b n) t m',b=B,t=T)  # (b h/patch w/patch), t, embed_dim
             ## Resizing time embeddings in case they don't match
             if T != self.time_embed.size(1):
                 time_embed = self.time_embed.transpose(1, 2)
@@ -282,27 +305,47 @@ class VisionTransformer(nn.Module):
                 new_time_embed = new_time_embed.transpose(1, 2)
                 x = x + new_time_embed
             else:
-                x = x + self.time_embed
+                x = x + self.time_embed  # (b h/patch w/patch), t, embed_dim
             x = self.time_drop(x)
-            x = rearrange(x, '(b n) t m -> b (n t) m',b=B,t=T)
-            x = torch.cat((cls_tokens, x), dim=1)
+            x = rearrange(x, '(b n) t m -> b (n t) m',b=B,t=T)  # b (h/patch w/patch t), embed_dim
+            x, mask = self.random_masking(x, mask_ratio)
+            x = torch.cat((cls_tokens, x), dim=1)  # b (h/patch w/patch t) + 1, embed_dim
 
         ## Attention blocks
         for blk in self.blocks:
-            x = blk(x, B, T, W)
+            x = blk(x, B, T, W)  # b, (h/patch w/patch t)+1, embed_dim
 
         ### Predictions for space-only baseline
         if self.attention_type == 'space_only':
             x = rearrange(x, '(b t) n m -> b t n m',b=B,t=T)
             x = torch.mean(x, 1) # averaging predictions for every frame
 
-        x = self.norm(x)
-        return x[:, 0]
+        x = self.norm(x)  # b, (h/patch w/patch t)+1, embed_dim
+        # remove cls token
+        return x[:, 1:], mask  # b, (h/patch w/patch t), embed_dim
 
-    def forward(self, x):
-        x = self.forward_features(x)
-        x = self.head(x)
-        return x
+    def forward_loss(self, imgs, pred, mask):
+        """
+        imgs: B, C, T, H, W
+        pred: B, (h/patch w/patch t), (patch patch channel)
+        mask: B, (h/patch w/patch t),  0 is keep, 1 is remove
+        """
+        target = self.patchify(imgs)  # b, (h/patch w/patch t), (patch patch channel)
+
+        loss = (pred - target) ** 2
+        loss = loss.mean(dim=-1)  # b, (h/patch w/patch t), mean loss per patch
+
+        loss = (loss * mask).sum() / mask.sum()  # mean loss on removed patches
+        return loss
+
+    def forward(self, x, mask_ratio=0.75):
+        # encoding path
+        encoded, mask = self.forward_features(x, mask_ratio)  # b, (h/patch w/patch t), embed_dim
+        # reconstruction path
+        pred = self.decoder(encoded)  # b, (h/patch w/patch t), (patch patch channel)
+        # loss
+        loss = self.forward_loss(x, pred, mask)
+        return loss, pred, mask
 
 def _conv_filter(state_dict, patch_size=16):
     """ convert patch embedding weight from manual patchify + linear proj to conv"""
