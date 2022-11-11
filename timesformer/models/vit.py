@@ -358,17 +358,19 @@ class VisionTransformer(nn.Module):
         """
         target = self.patchify(imgs)  # b, (h/patch w/patch t), (patch patch channel)
 
-        loss = (pred - target) ** 2
+        loss = (pred - target) ** 2  # pixel level loss.  b, (h/patch w/patch t), (patch patch channel)
 
         # within a patch, we only calculate loss over valid data pixels
         valid_data_mask = target != self.nodata_value
         loss = (loss * valid_data_mask).sum(-1) / valid_data_mask.sum(-1)  # b, (h/patch w/patch t), mean loss per patch
 
+        # get mask for patches that are not nan, i.e. 2b
         valid_patch_mask = ~loss.isnan()
-        loss = loss.nan_to_num()
+        # combine 2a and 2b, create our final patch-level mask
         mask = mask * valid_patch_mask
 
-        # across patches, we only calculate loss over masked patches
+        # across patches, we only calculate loss over masked+valid patches
+        loss = loss.nan_to_num()
         loss = (loss * mask).sum() / mask.sum()  # mean loss per batch
         return loss
 
