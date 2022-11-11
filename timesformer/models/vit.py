@@ -362,10 +362,10 @@ class VisionTransformer(nn.Module):
 
         # within a patch, we only calculate loss over valid data pixels
         valid_data_mask = target != self.nodata_value
-        loss = (loss * valid_data_mask).sum(-1) / valid_data_mask.sum(-1)
-        # loss = loss.nan_to_num()  # b, (h/patch w/patch t), mean loss per patch
+        loss = (loss * valid_data_mask).sum(-1) / valid_data_mask.sum(-1)  # b, (h/patch w/patch t), mean loss per patch
 
         valid_patch_mask = ~loss.isnan()
+        loss = loss.nan_to_num()
         mask = mask * valid_patch_mask
 
         # across patches, we only calculate loss over masked patches
