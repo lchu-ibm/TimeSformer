@@ -179,12 +179,15 @@ class VisionTransformer(nn.Module):
     """ Vision Transformere
     """
     def __init__(self, img_size=224, patch_size=16, in_chans=3, num_classes=1000, embed_dim=768, depth=12,
+                 nodata_value=-0.9999,
                  num_heads=12, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop_rate=0., attn_drop_rate=0.,
                  drop_path_rate=0.1, hybrid_backbone=None, norm_layer=nn.LayerNorm, num_frames=8, attention_type='divided_space_time', dropout=0.):
         super().__init__()
+        self.img_size = img_size
         self.patch_size = patch_size
         self.attention_type = attention_type
         self.depth = depth
+        self.nodata_value = nodata_value
         self.dropout = nn.Dropout(dropout)
         self.num_classes = num_classes
         self.num_features = self.embed_dim = embed_dim  # num_features for consistency with other models
@@ -269,6 +272,16 @@ class VisionTransformer(nn.Module):
 
         return x  # b, (h/patch w/patch t), (patch patch channel)
 
+    def unpatchify(self, x):
+        """
+        in: B, (h/patch w/patch t), (patch patch channel)
+        out: B, C, T, H, W
+        """
+        p = self.patch_size
+        num_p = self.img_size // self.patch_size
+        x = rearrange(x, 'b (h w t) (p q c) -> b c t (h p) (w q)', h=num_p, w=num_p, p=p, q=p)
+        return x
+
     def forward_features(self, x, mask_ratio):  # B, C, T, H, W
         B = x.shape[0]  # b
         x, T, W = self.patch_embed(x)  # (b t), (h/patch, w/patch), embed_dim  |   t   |   w/patch
@@ -333,12 +346,17 @@ class VisionTransformer(nn.Module):
         target = self.patchify(imgs)  # b, (h/patch w/patch t), (patch patch channel)
 
         loss = (pred - target) ** 2
-        loss = loss.mean(dim=-1)  # b, (h/patch w/patch t), mean loss per patch
 
-        loss = (loss * mask).sum() / mask.sum()  # mean loss on removed patches
+        # within a patch, we only calculate loss over valid data pixels
+        valid_data_mask = target != self.nodata_value
+        loss = (loss * valid_data_mask).sum(-1) / valid_data_mask.sum(-1)
+        loss = loss.nan_to_num()  # b, (h/patch w/patch t), mean loss per patch
+
+        # across patches, we only calculate loss over masked patches
+        loss = (loss * mask).sum() / mask.sum()  # mean loss per batch
         return loss
 
-    def forward(self, x, mask_ratio=0.75):
+    def forward(self, x, mask_ratio=0.75):  # B, C, T, H, W
         # encoding path
         encoded, mask = self.forward_features(x, mask_ratio)  # b, (h/patch w/patch t), embed_dim
         # reconstruction path
