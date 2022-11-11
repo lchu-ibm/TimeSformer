@@ -342,6 +342,19 @@ class VisionTransformer(nn.Module):
         imgs: B, C, T, H, W
         pred: B, (h/patch w/patch t), (patch patch channel)
         mask: B, (h/patch w/patch t),  0 is keep, 1 is remove
+
+        When calculating loss, we need to carefully deal with nodata values.
+        1. within each patch, we only calculate loss on pixels that have valid data
+        2. across patches, we only calculate loss when both conditions are met:
+            2a. patch is masked (of course)
+            2b. patch has at least 1 pixel with valid data
+
+        2b is tricky but also important here, imagine if a patch is masked but all pixel
+        values are nodata (which is quite common), then patch-level loss would be "nan"
+        as it is 0/0 from "loss = (loss * valid_data_mask).sum(-1) / valid_data_mask.sum(-1)".
+        We could convert nan to 0 but that would make loss less meaningful as records with
+        nodata values will naturally has much smaller loss, despite loss back-prop would
+        still work fine.
         """
         target = self.patchify(imgs)  # b, (h/patch w/patch t), (patch patch channel)
 
@@ -350,7 +363,10 @@ class VisionTransformer(nn.Module):
         # within a patch, we only calculate loss over valid data pixels
         valid_data_mask = target != self.nodata_value
         loss = (loss * valid_data_mask).sum(-1) / valid_data_mask.sum(-1)
-        loss = loss.nan_to_num()  # b, (h/patch w/patch t), mean loss per patch
+        # loss = loss.nan_to_num()  # b, (h/patch w/patch t), mean loss per patch
+
+        valid_patch_mask = ~loss.isnan()
+        mask = mask * valid_patch_mask
 
         # across patches, we only calculate loss over masked patches
         loss = (loss * mask).sum() / mask.sum()  # mean loss per batch
